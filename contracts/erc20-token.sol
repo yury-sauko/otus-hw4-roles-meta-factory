@@ -4,6 +4,8 @@ pragma solidity ^0.8.28;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
 import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
@@ -17,37 +19,73 @@ import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.
  * из OpenZeppelin. Минимальный набор ролей, в обучающих целях;
  * 
  * 2. Внедрите мета-транзакции в контракт.
- * ...
+ * Реализовано через EIP-712 для типизированных подписей
+ * и nonce для защиты от повторного использования мета-транзакций.
  */
 
-contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl {
+contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP712 {
+    /**
+     * @dev Расширим методы типа bytes32 методами из библиотеки ECDSA
+     * по восстановлению адреса подписанта.
+     */
+    using ECDSA for bytes32;
+
     // Переменные состояния расположим в правильном порядке
-    // для оптимизации упаковки в storage
+    // для оптимизации упаковки в storage.
 
-    // константа в storage не упаковывается
+    // Константы в storage не упаковываются.
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    
+    /**
+     * @dev Хеш определения типа для структуры Transfer в соответствии с EIP-712.
+     * Используется для формирования итогового хеша сообщения, 
+     * которое подписывает пользователь, для мета-транзакции transfer.
+     */
+    bytes32 private constant TRANSFER_TYPEHASH = 
+        keccak256("Transfer(address from,address to,uint256 amount,uint256 nonce,uint256 deadline)");
+    
+    /**
+     * @dev Хеш определения типа для структуры Approve в соответствии с EIP-712.
+     * Используется для формирования итогового хеша сообщения, 
+     * которое подписывает пользователь, для мета-транзакции approve.
+     */
+    bytes32 private constant APPROVE_TYPEHASH = 
+        keccak256("Approve(address owner,address spender,uint256 amount,uint256 nonce,uint256 deadline)");
 
-    // decimals занимает 1 байт из 32 в слоте, но вместе с ней упаковать нечего
+    // decimals занимает 1 байт из 32 в слоте, но вместе с ней упаковать нечего.
     uint8 public override decimals;
-    // totalSupply занимает следующий целый слот
+    // totalSupply занимает следующий целый слот.
     uint256 public override totalSupply;
 
-    // далее типы string и mapping, контролировать упаковку нельзя
+    // Далее типы string и mapping, контролировать упаковку нельзя.
     string public override name;
     string public override symbol;
     
     mapping(address account => uint256 balance) public override balanceOf;
     mapping(address owner => 
             mapping(address spender => uint256 allowedSum)) public override allowance;
-
-    // кастомная ошибка для функции _mint
-    error ERC20InvalidAmount(uint256 amount);
     
+    /**
+     * @dev Маппинг nonce для защиты от повторного использования мета-транзакций.
+     */
+    mapping(address account => uint256 nonce) public nonces;
+
+    /**
+     * @dev Кастомная ошибка для функции _mint. 
+     */
+    error ERC20InvalidAmount(uint256 amount);
+    // Кастомные ошибки для мета-транзакций.
+    error MetaTransactionExpired(uint256 deadline);
+    error InvalidSignature();
+    error InvalidNonce(address account, uint256 providedNonce, uint256 expectedNonce);
+    
+    // Помимо инициализаций в теле конструктора, инициализируем конструктор базового контракта
+    // EIP712, где "1" - назначаемая версия домена для подписи.
     constructor(
         string memory _name, 
         string memory _symbol, 
         uint8 _decimals
-    ) {
+    ) EIP712(_name, "1") {
         name = _name;
         symbol = _symbol;
         decimals = _decimals;
@@ -80,6 +118,54 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl {
         uint256 _amount
     ) external override returns (bool) {
         _transfer(msg.sender, _to, _amount);
+
+        return true;
+    }
+
+    /**
+     * @dev Мета-транзакция для transfer.
+     * Позволяет выполнить transfer от имени подписанта без оплаты газа.
+     * @param _from Адрес отправителя (подписанта).
+     * @param _to Адрес получателя.
+     * @param _amount Количество токенов.
+     * @param _deadline Срок действия транзакции (timestamp).
+     * @param _signature Подпись EIP-712 от _from.
+     */
+    function metaTransfer(
+        address _from,
+        address _to,
+        uint256 _amount,
+        uint256 _deadline,
+        bytes memory _signature
+    ) external returns (bool) {
+        // Проверяем валидность срока действия мета-транзакции.
+        if (block.timestamp > _deadline) {
+            revert MetaTransactionExpired(_deadline);
+        }
+
+        uint256 currentNonce = nonces[_from];
+        bytes32 structHash = keccak256(abi.encode(
+            TRANSFER_TYPEHASH,
+            _from,
+            _to,
+            _amount,
+            currentNonce,
+            _deadline
+        ));
+        bytes32 hash = _hashTypedDataV4(structHash);
+        // Восстанавливаем адрес подписанта из финального хеша и подписи.
+        address signer = hash.recover(_signature);
+
+        // Проверяем, что адрес подписанта совпадает с адресом отправителя.
+        if (signer != _from) {
+            revert InvalidSignature();
+        }
+
+        // Увеличиваем nonce после успешной проверки подписи.
+        nonces[_from]++;
+
+        // Выполняем перевод токенов от имени подписанта.
+        _transfer(_from, _to, _amount);
 
         return true;
     }
@@ -122,6 +208,60 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl {
     }
 
     /**
+     * @dev Мета-транзакция для approve.
+     * Позволяет выполнить approve от имени подписанта без оплаты газа.
+     * @param _owner Адрес владельца (подписанта)
+     * @param _spender Адрес получателя разрешения
+     * @param _amount Количество токенов
+     * @param _deadline Срок действия транзакции (timestamp)
+     * @param _signature Подпись EIP-712 от _owner
+     */
+    function metaApprove(
+        address _owner,
+        address _spender,
+        uint256 _amount,
+        uint256 _deadline,
+        bytes memory _signature
+    ) external returns (bool) {
+        // Проверяем валидность срока действия мета-транзакции.
+        if (block.timestamp > _deadline) {
+            revert MetaTransactionExpired(_deadline);
+        }
+
+        if (_spender == address(0)) {
+            revert ERC20InvalidSpender(_spender);
+        }        
+
+        uint256 currentNonce = nonces[_owner];
+        bytes32 structHash = keccak256(abi.encode(
+            APPROVE_TYPEHASH,
+            _owner,
+            _spender,
+            _amount,
+            currentNonce,
+            _deadline
+        ));
+        bytes32 hash = _hashTypedDataV4(structHash);
+        // Восстанавливаем адрес подписанта из финального хеша и подписи.
+        address signer = hash.recover(_signature);
+
+        // Проверяем, что адрес подписанта совпадает с адресом владельца.
+        if (signer != _owner) {
+            revert InvalidSignature();
+        }
+
+        // Увеличиваем nonce после успешной проверки подписи.
+        nonces[_owner]++;
+
+        // Устанавливаем allowance для получателя разрешения от имени подписанта.
+        allowance[_owner][_spender] = _amount;
+
+        emit Approval(_owner, _spender, _amount);
+
+        return true;
+    }
+
+    /**
      * @dev внутренняя функция для минта токенов.
      * Обязательно наличие модификатора onlyRole в вызывающей функции с ролью MINTER_ROLE!
      */
@@ -129,12 +269,12 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl {
         address _to,
         uint256 _amount
     ) private {
-        // исключаем использование функции _mint для сжигания токенов.
-        // Функционал сжигания для упрощения в контракте не предусмотрен
+        // Исключаем использование функции _mint для сжигания токенов.
+        // Функционал сжигания для упрощения в контракте не предусмотрен.
         if (_to == address(0)) {
             revert ERC20InvalidReceiver(_to);
         }
-        // предотвращаем минт нулевого количества токенов
+        // Предотвращаем минт нулевого количества токенов.
         if (_amount == 0) {
             revert ERC20InvalidAmount(_amount);
         }
