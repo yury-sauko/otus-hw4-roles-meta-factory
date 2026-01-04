@@ -21,6 +21,9 @@ import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.
  * 2. Внедрите мета-транзакции в контракт.
  * Реализовано через EIP-712 для типизированных подписей
  * и nonce для защиты от повторного использования мета-транзакций.
+ * 
+ * 3. Реализуйте функцию permit в ERC20 токене по стандарту ERC2612.
+ * Выполнено.
  */
 
 contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP712 {
@@ -51,6 +54,14 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP7
      */
     bytes32 private constant APPROVE_TYPEHASH = 
         keccak256("Approve(address owner,address spender,uint256 amount,uint256 nonce,uint256 deadline)");
+    
+    /**
+     * @dev Хеш определения типа для структуры Permit в соответствии с ERC2612.
+     * Используется для формирования итогового хеша сообщения, 
+     * которое подписывает пользователь, для функции permit.
+     */
+    bytes32 private constant PERMIT_TYPEHASH = 
+        keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
 
     // decimals занимает 1 байт из 32 в слоте, но вместе с ней упаковать нечего.
     uint8 public override decimals;
@@ -74,8 +85,9 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP7
      * @dev Кастомная ошибка для функции _mint. 
      */
     error ERC20InvalidAmount(uint256 amount);
-    // Кастомные ошибки для мета-транзакций.
+    // Кастомные ошибки для мета-транзакций и permit.
     error MetaTransactionExpired(uint256 deadline);
+    error PermitExpired(uint256 deadline);
     error InvalidSignature();
     error InvalidNonce(address account, uint256 providedNonce, uint256 expectedNonce);
     
@@ -157,7 +169,7 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP7
         address signer = hash.recover(_signature);
 
         // Проверяем, что адрес подписанта совпадает с адресом отправителя.
-        if (signer != _from) {
+        if (signer != _from || signer == address(0)) {
             revert InvalidSignature();
         }
 
@@ -210,11 +222,11 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP7
     /**
      * @dev Мета-транзакция для approve.
      * Позволяет выполнить approve от имени подписанта без оплаты газа.
-     * @param _owner Адрес владельца (подписанта)
-     * @param _spender Адрес получателя разрешения
-     * @param _amount Количество токенов
-     * @param _deadline Срок действия транзакции (timestamp)
-     * @param _signature Подпись EIP-712 от _owner
+     * @param _owner Адрес владельца (подписанта).
+     * @param _spender Адрес получателя разрешения.
+     * @param _amount Количество токенов.
+     * @param _deadline Срок действия транзакции (timestamp).
+     * @param _signature Подпись EIP-712 от _owner.
      */
     function metaApprove(
         address _owner,
@@ -246,7 +258,7 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP7
         address signer = hash.recover(_signature);
 
         // Проверяем, что адрес подписанта совпадает с адресом владельца.
-        if (signer != _owner) {
+        if (signer != _owner || signer == address(0)) {
             revert InvalidSignature();
         }
 
@@ -259,6 +271,63 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP7
         emit Approval(_owner, _spender, _amount);
 
         return true;
+    }
+
+    /**
+     * @dev Функция permit по стандарту ERC2612.
+     * Позволяет владельцу токенов подписать разрешение для spender'а без выполнения транзакции
+     * (и соответственно без оплаты газа за транзакцию).
+     * @param _owner Адрес владельца токенов (подписанта).
+     * @param _spender Адрес получателя разрешения.
+     * @param _value Количество токенов.
+     * @param _deadline Срок действия разрешения (timestamp).
+     * @param _v Компонент v подписи ECDSA.
+     * @param _r Компонент r подписи ECDSA.
+     * @param _s Компонент s подписи ECDSA.
+     */
+    function permit(
+        address _owner,
+        address _spender,
+        uint256 _value,
+        uint256 _deadline,
+        uint8 _v,
+        bytes32 _r,
+        bytes32 _s
+    ) external {
+        // Проверяем валидность срока действия разрешения.
+        if (block.timestamp > _deadline) {
+            revert PermitExpired(_deadline);
+        }
+
+        if (_spender == address(0)) {
+            revert ERC20InvalidSpender(_spender);
+        }
+
+        uint256 currentNonce = nonces[_owner];
+        bytes32 structHash = keccak256(abi.encode(
+            PERMIT_TYPEHASH,
+            _owner,
+            _spender,
+            _value,
+            currentNonce,
+            _deadline
+        ));
+        bytes32 hash = _hashTypedDataV4(structHash);        
+        // Восстанавливаем адрес подписанта из финального хеша и компонентов подписи.
+        address signer = ecrecover(hash, _v, _r, _s);
+
+        // Проверяем, что адрес подписанта совпадает с адресом владельца.
+        if (signer != _owner || signer == address(0)) {
+            revert InvalidSignature();
+        }
+
+        // Увеличиваем nonce после успешной проверки подписи.
+        nonces[_owner]++;
+
+        // Устанавливаем allowance для получателя разрешения от имени подписанта.
+        allowance[_owner][_spender] = _value;
+
+        emit Approval(_owner, _spender, _value);
     }
 
     /**
