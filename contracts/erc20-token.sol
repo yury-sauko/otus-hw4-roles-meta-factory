@@ -3,30 +3,31 @@ pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
-/**
- * Урок 20, задачи по ДЗ:
- * 1. Создайте контракт с уровнями доступа.
- * Примененные в контракте механизмы контроля доступа:
- * - условные выражения с оператором revert для отклонения транзакций при несоблюдении условий;
- * - модификаторы видимости private, external;
- * - механизм ограничения доступа на основе ролей (RBAC) с использованием AccessControl 
- * из OpenZeppelin. Минимальный набор ролей, в обучающих целях;
- * 
- * 2. Внедрите мета-транзакции в контракт.
- * Реализовано через EIP-712 для типизированных подписей
- * и nonce для защиты от повторного использования мета-транзакций.
- * 
- * 3. Реализуйте функцию permit в ERC20 токене по стандарту ERC2612.
- * Выполнено.
- */
+contract ERC20Token is 
+    IERC20, 
+    IERC20Metadata, 
+    IERC20Errors, 
+    Initializable,
+    AccessControlUpgradeable, 
+    EIP712Upgradeable,
+    UUPSUpgradeable 
+{
+    /**
+     * @dev В конструкторе отключаем возможность инициализации контракта реализации напрямую,
+     * оставляя возможность инициализации только через прокси.
+     */
+    constructor() {
+        _disableInitializers();
+    }
 
-contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP712 {
     /**
      * @dev Расширим методы типа bytes32 методами из библиотеки ECDSA
      * по восстановлению адреса подписанта.
@@ -85,19 +86,30 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP7
      * @dev Кастомная ошибка для функции _mint. 
      */
     error ERC20InvalidAmount(uint256 amount);
-    // Кастомные ошибки для мета-транзакций и permit.
+    // Кастомные ошибки для мета-транзакций, permit и обновления контракта.
     error MetaTransactionExpired(uint256 deadline);
     error PermitExpired(uint256 deadline);
     error InvalidSignature();
     error InvalidNonce(address account, uint256 providedNonce, uint256 expectedNonce);
+    error ERC20InvalidImplementation(address implementation);
     
-    // Помимо инициализаций в теле конструктора, инициализируем конструктор базового контракта
-    // EIP712, где "1" - назначаемая версия домена для подписи.
-    constructor(
+    /**
+     * @dev Функция инициализации контракта вместо конструктора.
+     * Вызывается один раз при деплое прокси-контракта.
+     * @param _name Название токена.
+     * @param _symbol Символ токена.
+     * @param _decimals Количество знаков после запятой.
+     */
+    function initialize(
         string memory _name, 
         string memory _symbol, 
         uint8 _decimals
-    ) EIP712(_name, "1") {
+    ) public initializer {
+        // Инициализируем базовые контракты
+        __AccessControl_init();
+        __EIP712_init(_name, "1");
+        __UUPSUpgradeable_init();
+
         name = _name;
         symbol = _symbol;
         decimals = _decimals;
@@ -111,6 +123,30 @@ contract ERC20Token is IERC20, IERC20Metadata, IERC20Errors, AccessControl, EIP7
 
         // при развертывании контракта сразу начислим владельцу 1_000 токенов
         _mint(msg.sender, initialOwnerAmount);
+    }
+
+    /**
+     * @dev Функция авторизации обновления контракта по стандарту UUPS.
+     * Только адреса с ролью DEFAULT_ADMIN_ROLE могут обновлять контракт.
+     * @param newImplementation Адрес новой реализации контракта.
+     */
+    function _authorizeUpgrade(address newImplementation) 
+        internal 
+        virtual
+        override 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        if (newImplementation == address(0)) {
+            revert ERC20InvalidImplementation(newImplementation);
+        }
+    }
+
+    /**
+     * @dev Возвращает версию контракта.
+     * Помечена как virtual для возможности переопределения в дочерних контрактах.
+     */
+    function version() public pure virtual returns (string memory) {
+        return "version 1";
     }
 
     /**
